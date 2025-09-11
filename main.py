@@ -10,7 +10,7 @@ from pydantic import BaseModel
 BITRIX_BASE_URL = (os.getenv("BITRIX_BASE_URL") or "").rstrip("/") + "/"
 API_KEY = os.getenv("API_KEY")
 
-app = FastAPI(title="Renovallanta Bitrix Aggregator", version="1.1.0")
+app = FastAPI(title="Renovallanta Bitrix Aggregator", version="1.2.0")
 
 
 # ===================== Utilidades =====================
@@ -28,9 +28,6 @@ async def bitrix_call(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def bitrix_fetch_all(method: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Maneja paginación 'start' y diferentes formatos de 'result'
-    """
     items: List[Dict[str, Any]] = []
     start = 0
     while True:
@@ -38,7 +35,6 @@ async def bitrix_fetch_all(method: str, params: Dict[str, Any]) -> List[Dict[str
         payload["start"] = start
         data = await bitrix_call(method, payload)
         result = data.get("result") or {}
-
         if isinstance(result, list):
             chunk = result
         elif isinstance(result, dict) and "tasks" in result:
@@ -47,7 +43,6 @@ async def bitrix_fetch_all(method: str, params: Dict[str, Any]) -> List[Dict[str
             chunk = result.get("items") or []
         else:
             chunk = result.get("activities") or result.get("events") or []
-
         items.extend(chunk)
         next_start = data.get("next")
         if next_start is None:
@@ -70,7 +65,7 @@ class TasksIn(BaseModel):
     to_dt: Optional[datetime] = None
     responsible_ids: Optional[List[int]] = None
     member_ids: Optional[List[int]] = None     # responsable/creador/participante/observador
-    group_ids: Optional[List[int]] = None      # IDs de proyectos/grupos (Visitas Zona Norte=9)
+    group_ids: Optional[List[int]] = None      # IDs de proyectos/grupos (Visitas)
     status: Optional[List[int]] = None
     date_field: Optional[str] = "DEADLINE"     # DEADLINE | CREATED_DATE | CLOSED_DATE
 
@@ -81,7 +76,7 @@ class CalendarIn(BaseModel):
     owner_ids: Optional[List[int]] = None
 
 
-# ===================== Auth sencilla =====================
+# ===================== Auth =====================
 async def ensure_api_key(x_api_key: Optional[str]):
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="API key inválida")
@@ -108,7 +103,6 @@ async def list_activities(payload: ActivitiesIn, x_api_key: Optional[str] = Head
     now = datetime.utcnow()
     from_dt = payload.from_dt or (now - timedelta(days=7))
     to_dt = payload.to_dt or now
-
     filt: Dict[str, Any] = {
         ">=CREATED": from_dt.strftime("%Y-%m-%dT%H:%M:%S"),
         "<=CREATED": to_dt.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -119,7 +113,6 @@ async def list_activities(payload: ActivitiesIn, x_api_key: Optional[str] = Head
         filt["COMPLETED"] = payload.completed
     if payload.types:
         filt["TYPE_ID"] = payload.types
-
     params = {
         "filter": filt,
         "select": [
@@ -132,9 +125,30 @@ async def list_activities(payload: ActivitiesIn, x_api_key: Optional[str] = Head
     return {"items": rows, "count": len(rows)}
 
 
-# --------- NUEVO /tasks con filtro por DEADLINE ---------
+# -------------------- /tasks (DEADLINE defensivo) --------------------
 def _dtstr(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _parse_deadline(v: Any) -> Optional[datetime]:
+    if not v:
+        return None
+    s = str(v).strip()
+    # formatos comunes: "YYYY-MM-DD", "YYYY-MM-DD HH:MM:SS", "YYYY-MM-DDTHH:MM:SS(+TZ)?"
+    try:
+        if len(s) == 10 and s[4] == "-" and s[7] == "-":
+            # solo fecha
+            return datetime.fromisoformat(s + "T00:00:00")
+        if " " in s and "T" not in s:
+            s = s.replace(" ", "T")
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.fromisoformat(s)
+    except Exception:
+        try:
+            return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
 
 
 @app.post("/tasks")
@@ -145,16 +159,22 @@ async def list_tasks(payload: TasksIn, x_api_key: Optional[str] = Header(default
     from_dt = payload.from_dt or (now - timedelta(days=7))
     to_dt = payload.to_dt or now
 
-    # Campo de fecha elegido
     date_key = (payload.date_field or "DEADLINE").upper()
     if date_key not in {"DEADLINE", "CREATED_DATE", "CLOSED_DATE"}:
         date_key = "DEADLINE"
 
-    # Filtro base por rango
-    base_filter: Dict[str, Any] = {
-        f">={date_key}": _dtstr(from_dt),
-        f"<={date_key}": _dtstr(to_dt),
-    }
+    # --- Construimos filtro hacia Bitrix ---
+    base_filter: Dict[str, Any] = {}
+    # Si pedimos DEADLINE, NO confiamos en el filtro remoto: usamos CREATED_DATE ancho
+    if date_key == "DEADLINE":
+        wide_from = from_dt - timedelta(days=21)
+        wide_to = to_dt + timedelta(days=7)
+        base_filter[">=CREATED_DATE"] = _dtstr(wide_from)
+        base_filter["<=CREATED_DATE"] = _dtstr(wide_to)
+    else:
+        base_filter[f">={date_key}"] = _dtstr(from_dt)
+        base_filter[f"<={date_key}"] = _dtstr(to_dt)
+
     if payload.status:
         base_filter["STATUS"] = payload.status
     if payload.group_ids:
@@ -169,16 +189,10 @@ async def list_tasks(payload: TasksIn, x_api_key: Optional[str] = Header(default
     ]
 
     async def fetch_with(extra: Dict[str, Any]) -> List[Dict[str, Any]]:
-        params = {
-            "filter": {**base_filter, **extra},
-            "select": selects,
-            "order": {date_key: "ASC"}
-        }
+        params = {"filter": {**base_filter, **extra}, "select": selects, "order": {"ID": "DESC"}}
         return await bitrix_fetch_all("tasks.task.list", params)
 
     rows: List[Dict[str, Any]] = []
-
-    # MEMBER cubre responsable/creador/participantes/observadores
     if payload.member_ids:
         seen: set[str] = set()
         for mid in payload.member_ids:
@@ -186,32 +200,31 @@ async def list_tasks(payload: TasksIn, x_api_key: Optional[str] = Header(default
             for t in chunk:
                 tid = str(t.get("ID"))
                 if tid not in seen:
-                    rows.append(t)
-                    seen.add(tid)
+                    rows.append(t); seen.add(tid)
     elif payload.responsible_ids:
         rows = await fetch_with({"RESPONSIBLE_ID": payload.responsible_ids})
     else:
         rows = await fetch_with({})
 
-    # Filtro defensivo por DEADLINE cuando es el campo elegido
+    # --- Filtro local por DEADLINE cuando corresponde ---
     if date_key == "DEADLINE":
-        def parse(s: str):
+        rows = [t for t in rows if (dt := _parse_deadline(t.get("DEADLINE"))) and from_dt <= dt <= to_dt]
+
+    # Orden final por DEADLINE ascendente (fallback CREATED_DATE)
+    def _sort_key(t: Dict[str, Any]):
+        d = _parse_deadline(t.get("DEADLINE"))
+        if d is None:
+            cd = t.get("CREATED_DATE")
             try:
-                s = str(s).replace("Z", "+00:00")
-                return datetime.fromisoformat(s)
+                cd = datetime.fromisoformat(str(cd).replace("Z", "+00:00"))
             except Exception:
-                return None
+                cd = datetime.max
+            return (datetime.max, cd)
+        return (d, datetime.max)
 
-        rows = [
-            t for t in rows
-            if (dt := parse(t.get("DEADLINE"))) and from_dt <= dt <= to_dt
-        ]
-
-    # Orden final por DEADLINE ascendente (o por CREATED_DATE si no hay DEADLINE)
-    rows.sort(key=lambda t: (t.get("DEADLINE") or t.get("CREATED_DATE") or ""))
-
+    rows.sort(key=_sort_key)
     return {"items": rows, "count": len(rows)}
-# --------------------------------------------------------
+# --------------------------------------------------------------------
 
 
 @app.post("/calendar")
@@ -220,11 +233,9 @@ async def list_calendar(payload: CalendarIn, x_api_key: Optional[str] = Header(d
     now = datetime.utcnow()
     from_dt = payload.from_dt or (now - timedelta(days=7))
     to_dt = payload.to_dt or now
-
     owner_ids = payload.owner_ids or []
     if not owner_ids:
         return {"items": [], "count": 0}
-
     all_events: List[Dict[str, Any]] = []
     for uid in owner_ids:
         params = {
@@ -237,5 +248,4 @@ async def list_calendar(payload: CalendarIn, x_api_key: Optional[str] = Header(d
         data = await bitrix_call("calendar.event.get", params)
         events = data.get("result") or []
         all_events.extend(events)
-
     return {"items": all_events, "count": len(all_events)}
