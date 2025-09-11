@@ -1,6 +1,6 @@
 import os
 from typing import Dict, Any, List, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException
@@ -10,7 +10,7 @@ from pydantic import BaseModel
 BITRIX_BASE_URL = (os.getenv("BITRIX_BASE_URL") or "").rstrip("/") + "/"
 API_KEY = os.getenv("API_KEY")
 
-app = FastAPI(title="Renovallanta Bitrix Aggregator", version="1.2.0")
+app = FastAPI(title="Renovallanta Bitrix Aggregator", version="1.3.0")
 
 
 # ===================== Utilidades =====================
@@ -65,7 +65,7 @@ class TasksIn(BaseModel):
     to_dt: Optional[datetime] = None
     responsible_ids: Optional[List[int]] = None
     member_ids: Optional[List[int]] = None     # responsable/creador/participante/observador
-    group_ids: Optional[List[int]] = None      # IDs de proyectos/grupos (Visitas)
+    group_ids: Optional[List[int]] = None      # IDs de grupos/proyectos (Visitas)
     status: Optional[List[int]] = None
     date_field: Optional[str] = "DEADLINE"     # DEADLINE | CREATED_DATE | CLOSED_DATE
 
@@ -103,6 +103,7 @@ async def list_activities(payload: ActivitiesIn, x_api_key: Optional[str] = Head
     now = datetime.utcnow()
     from_dt = payload.from_dt or (now - timedelta(days=7))
     to_dt = payload.to_dt or now
+
     filt: Dict[str, Any] = {
         ">=CREATED": from_dt.strftime("%Y-%m-%dT%H:%M:%S"),
         "<=CREATED": to_dt.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -113,6 +114,7 @@ async def list_activities(payload: ActivitiesIn, x_api_key: Optional[str] = Head
         filt["COMPLETED"] = payload.completed
     if payload.types:
         filt["TYPE_ID"] = payload.types
+
     params = {
         "filter": filt,
         "select": [
@@ -125,7 +127,7 @@ async def list_activities(payload: ActivitiesIn, x_api_key: Optional[str] = Head
     return {"items": rows, "count": len(rows)}
 
 
-# -------------------- /tasks (DEADLINE defensivo) --------------------
+# ===================== /tasks con DEADLINE robusto =====================
 def _dtstr(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S")
 
@@ -134,10 +136,8 @@ def _parse_deadline(v: Any) -> Optional[datetime]:
     if not v:
         return None
     s = str(v).strip()
-    # formatos comunes: "YYYY-MM-DD", "YYYY-MM-DD HH:MM:SS", "YYYY-MM-DDTHH:MM:SS(+TZ)?"
     try:
         if len(s) == 10 and s[4] == "-" and s[7] == "-":
-            # solo fecha
             return datetime.fromisoformat(s + "T00:00:00")
         if " " in s and "T" not in s:
             s = s.replace(" ", "T")
@@ -151,6 +151,13 @@ def _parse_deadline(v: Any) -> Optional[datetime]:
             return None
 
 
+def _to_utc_aware(dt: datetime) -> datetime:
+    """Devuelve dt como datetime *con tz* UTC para comparar de forma segura."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 @app.post("/tasks")
 async def list_tasks(payload: TasksIn, x_api_key: Optional[str] = Header(default=None)):
     await ensure_api_key(x_api_key)
@@ -159,14 +166,18 @@ async def list_tasks(payload: TasksIn, x_api_key: Optional[str] = Header(default
     from_dt = payload.from_dt or (now - timedelta(days=7))
     to_dt = payload.to_dt or now
 
+    # Normalizamos rango a UTC-aware
+    from_utc = _to_utc_aware(from_dt)
+    to_utc = _to_utc_aware(to_dt)
+
     date_key = (payload.date_field or "DEADLINE").upper()
     if date_key not in {"DEADLINE", "CREATED_DATE", "CLOSED_DATE"}:
         date_key = "DEADLINE"
 
-    # --- Construimos filtro hacia Bitrix ---
+    # Filtro hacia Bitrix
     base_filter: Dict[str, Any] = {}
-    # Si pedimos DEADLINE, NO confiamos en el filtro remoto: usamos CREATED_DATE ancho
     if date_key == "DEADLINE":
+        # Rango amplio por CREATED_DATE y luego filtramos local por DEADLINE
         wide_from = from_dt - timedelta(days=21)
         wide_to = to_dt + timedelta(days=7)
         base_filter[">=CREATED_DATE"] = _dtstr(wide_from)
@@ -193,11 +204,23 @@ async def list_tasks(payload: TasksIn, x_api_key: Optional[str] = Header(default
         return await bitrix_fetch_all("tasks.task.list", params)
 
     rows: List[Dict[str, Any]] = []
-    if payload.member_ids:
+    # Si llegan ambos filtros, unimos resultados (algunas instalaciones no aceptan MEMBER+GROUP_ID)
+    if payload.member_ids and payload.group_ids:
         seen: set[str] = set()
         for mid in payload.member_ids:
-            chunk = await fetch_with({"MEMBER": mid})
-            for t in chunk:
+            for t in await fetch_with({"MEMBER": mid}):
+                tid = str(t.get("ID"))
+                if tid not in seen:
+                    rows.append(t); seen.add(tid)
+        for gid in payload.group_ids:
+            for t in await fetch_with({"GROUP_ID": [gid]}):
+                tid = str(t.get("ID"))
+                if tid not in seen:
+                    rows.append(t); seen.add(tid)
+    elif payload.member_ids:
+        seen: set[str] = set()
+        for mid in payload.member_ids:
+            for t in await fetch_with({"MEMBER": mid}):
                 tid = str(t.get("ID"))
                 if tid not in seen:
                     rows.append(t); seen.add(tid)
@@ -206,25 +229,32 @@ async def list_tasks(payload: TasksIn, x_api_key: Optional[str] = Header(default
     else:
         rows = await fetch_with({})
 
-    # --- Filtro local por DEADLINE cuando corresponde ---
+    # Filtro local por DEADLINE (normalizando a UTC) cuando corresponde
     if date_key == "DEADLINE":
-        rows = [t for t in rows if (dt := _parse_deadline(t.get("DEADLINE"))) and from_dt <= dt <= to_dt]
+        def _deadline_utc(t: Dict[str, Any]) -> Optional[datetime]:
+            d = _parse_deadline(t.get("DEADLINE"))
+            if d is None:
+                return None
+            return _to_utc_aware(d)
+
+        rows = [t for t in rows if (du := _deadline_utc(t)) and (from_utc <= du <= to_utc)]
 
     # Orden final por DEADLINE ascendente (fallback CREATED_DATE)
     def _sort_key(t: Dict[str, Any]):
         d = _parse_deadline(t.get("DEADLINE"))
+        d = _to_utc_aware(d) if d else None
         if d is None:
             cd = t.get("CREATED_DATE")
             try:
-                cd = datetime.fromisoformat(str(cd).replace("Z", "+00:00"))
+                cd = _to_utc_aware(datetime.fromisoformat(str(cd).replace("Z", "+00:00")))
             except Exception:
-                cd = datetime.max
-            return (datetime.max, cd)
-        return (d, datetime.max)
+                cd = datetime.max.replace(tzinfo=timezone.utc)
+            return (datetime.max.replace(tzinfo=timezone.utc), cd)
+        return (d, datetime.max.replace(tzinfo=timezone.utc))
 
     rows.sort(key=_sort_key)
     return {"items": rows, "count": len(rows)}
-# --------------------------------------------------------------------
+# ==========================================================
 
 
 @app.post("/calendar")
@@ -233,9 +263,11 @@ async def list_calendar(payload: CalendarIn, x_api_key: Optional[str] = Header(d
     now = datetime.utcnow()
     from_dt = payload.from_dt or (now - timedelta(days=7))
     to_dt = payload.to_dt or now
+
     owner_ids = payload.owner_ids or []
     if not owner_ids:
         return {"items": [], "count": 0}
+
     all_events: List[Dict[str, Any]] = []
     for uid in owner_ids:
         params = {
@@ -248,4 +280,5 @@ async def list_calendar(payload: CalendarIn, x_api_key: Optional[str] = Header(d
         data = await bitrix_call("calendar.event.get", params)
         events = data.get("result") or []
         all_events.extend(events)
+
     return {"items": all_events, "count": len(all_events)}
