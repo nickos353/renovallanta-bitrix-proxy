@@ -204,21 +204,37 @@ async def auth_check(
 
 
 # ----------------------------
-# Users
+# Users (reemplaza toda esta sección)
 # ----------------------------
+def _truthy(v):
+    # Acepta True/False, "Y"/"N", "1"/"0", "true"/"false", etc.
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return True
+    return str(v).strip().upper() in {"Y", "YES", "SI", "TRUE", "1"}
+
 @app.get("/users")
 async def list_users(x_api_key: Optional[str] = Header(default=None)):
     await ensure_api_key(x_api_key)
 
-    # 'user.get' sin filtros y filtramos activos en Python
+    # 1) Intento principal
     rows = await bitrix_fetch_all("user.get", {})
-    active = [u for u in rows if str(u.get("ACTIVE", "Y")).upper() == "Y"]
+
+    # 2) Fallback por si el portal restringe user.get
+    if not rows:
+        rows = await bitrix_fetch_all("user.search", {"ACTIVE": "true"})
+
+    # Filtra activos con tolerancia a formato
+    active = [u for u in rows if _truthy(u.get("ACTIVE", True))]
+
     items = [
         {
             "ID": u.get("ID"),
             "NAME": u.get("NAME"),
             "LAST_NAME": u.get("LAST_NAME"),
             "WORK_POSITION": u.get("WORK_POSITION"),
+            "ACTIVE": u.get("ACTIVE"),
         }
         for u in active
     ]
