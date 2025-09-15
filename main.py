@@ -1,27 +1,69 @@
 # main.py
 import os
+import sys
 import asyncio
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta
 
 import aiohttp
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, status
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # ----------------------------
 # Configuración
 # ----------------------------
-BITRIX_BASE = (os.getenv("BITRIX_WEBHOOK_BASE") or "").rstrip("/")
+_raw_base = os.getenv("BITRIX_WEBHOOK_BASE") or ""
+BITRIX_BASE = _raw_base.strip()
 API_KEY = os.getenv("API_KEY")  # si no está definido, no se exige clave
 
 if not BITRIX_BASE:
     raise RuntimeError("Falta la variable de entorno BITRIX_WEBHOOK_BASE")
 
+def _join_method(base: str, method: str) -> str:
+    """Une base + método asegurando un único slash y sufijo .json."""
+    b = base.rstrip("/")
+    m = method.strip().lstrip("/")
+    return f"{b}/{m}.json"
+
+def _fmt(dt: datetime) -> str:
+    """Formatea datetimes a 'YYYY-MM-DDTHH:MM:SS' (sin zona horaria)."""
+    return dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+def log(*args: Any) -> None:
+    print(*args, file=sys.stdout, flush=True)
+
 
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Renovallanta Bitrix Proxy", version="1.3.2")
+app = FastAPI(title="Renovallanta Bitrix Proxy", version="1.4.1")
+
+# CORS (ajústalo según tus necesidades)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Reutilizar una sola sesión HTTP
+_session: Optional[aiohttp.ClientSession] = None
+
+@app.on_event("startup")
+async def _startup() -> None:
+    global _session
+    if _session is None:
+        _session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+    log("[startup] Proxy listo")
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    global _session
+    if _session is not None:
+        await _session.close()
+        _session = None
+    log("[shutdown] Sesión HTTP cerrada")
 
 
 # ----------------------------
@@ -33,22 +75,22 @@ async def _bitrix_call(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
     URL final: {BITRIX_BASE}/{method}.json
     Envía los params como JSON. Maneja errores de Bitrix.
     """
-    url = f"{BITRIX_BASE}/{method}.json"
-    async with aiohttp.ClientSession(raise_for_status=False) as session:
-        async with session.post(url, json=params) as resp:
-            # Aceptamos 200/400/401 etc., y devolvemos el JSON para inspección
-            try:
-                data = await resp.json()
-            except Exception:
-                text = await resp.text()
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Bitrix sin JSON válido. HTTP {resp.status}: {text[:300]}",
-                )
-            # Bitrix puede responder 200 con {"error": "..."}
-            if "error" in data:
-                raise HTTPException(status_code=400, detail=data)
-            return data
+    assert _session is not None, "HTTP session no inicializada"
+    url = _join_method(BITRIX_BASE, method)
+    async with _session.post(url, json=params) as resp:
+        # Devolvemos el JSON (o error entendible) sin ocultar códigos HTTP
+        try:
+            data = await resp.json()
+        except Exception:
+            text = await resp.text()
+            raise HTTPException(
+                status_code=502,
+                detail=f"Bitrix sin JSON válido. HTTP {resp.status}: {text[:300]}",
+            )
+        # Bitrix a veces responde 200 con {"error": "..."}
+        if "error" in data:
+            raise HTTPException(status_code=400, detail=data)
+        return data
 
 
 async def bitrix_fetch_all(method: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -65,15 +107,13 @@ async def bitrix_fetch_all(method: str, params: Dict[str, Any]) -> List[Dict[str
             page_params["start"] = start
         data = await _bitrix_call(method, page_params)
 
-        # La forma del resultado varía por método
         result = data.get("result")
 
         if isinstance(result, dict):
-            # Ej.: tasks.task.list devuelve un dict con 'tasks' o con las tareas directas
+            # Ej.: tasks.task.list devuelve un dict con 'tasks' o con listas internas
             if "tasks" in result and isinstance(result["tasks"], list):
                 items.extend(result["tasks"])
             else:
-                # Si fuera un dict de eventos u otro, intenta aplanar listas internas
                 for v in result.values():
                     if isinstance(v, list):
                         items.extend(v)
@@ -86,11 +126,6 @@ async def bitrix_fetch_all(method: str, params: Dict[str, Any]) -> List[Dict[str
         start = next_start
 
     return items
-
-
-def _fmt(dt: datetime) -> str:
-    """Formatea datetimes a 'YYYY-MM-DDTHH:MM:SS' (sin zona horaria)."""
-    return dt.strftime("%Y-%m-%dT%H:%M:%S")
 
 
 # ----------------------------
@@ -130,24 +165,29 @@ async def ensure_api_key(x_api_key: Optional[str] = Header(default=None)):
     Exige API Key si API_KEY está configurada.
     """
     if API_KEY and x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="API key inválida")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="API key inválida")
 
 
 # ----------------------------
-# Endpoints básicos
+# Endpoints de salud
 # ----------------------------
 @app.get("/")
 async def root():
     return {"ok": True, "service": "renovallanta-bitrix-proxy"}
 
+@app.get("/ping")
+async def ping():
+    return {"ok": True, "service": "renovallanta-bitrix-proxy"}
 
-# Diagnóstico: comprueba si llega la API Key (por header o query)
+
+# ----------------------------
+# Diagnóstico de auth (igual que tu versión)
+# ----------------------------
 async def _get_any_key(
     x_api_key: Optional[str] = Header(default=None),
     api_key: Optional[str] = Query(default=None),
 ) -> Optional[str]:
     return x_api_key or api_key
-
 
 @app.get("/auth_check")
 async def auth_check(
@@ -170,17 +210,9 @@ async def auth_check(
 async def list_users(x_api_key: Optional[str] = Header(default=None)):
     await ensure_api_key(x_api_key)
 
-    # Puedes usar 'user.search' o 'user.get'. Aquí usamos 'user.get' y filtramos activos.
-    params: Dict[str, Any] = {
-        # sin filtros; Bitrix no siempre acepta 'ACTIVE' en user.get,
-        # así que filtramos luego en Python.
-    }
-    rows = await bitrix_fetch_all("user.get", params)
-
-    # Quedarnos solo con los activos (ACTIVE == "Y")
+    # 'user.get' sin filtros y filtramos activos en Python
+    rows = await bitrix_fetch_all("user.get", {})
     active = [u for u in rows if str(u.get("ACTIVE", "Y")).upper() == "Y"]
-
-    # Reducimos a lo esencial si quieres devolver más limpio:
     items = [
         {
             "ID": u.get("ID"),
@@ -204,7 +236,6 @@ async def list_tasks(payload: TasksIn, x_api_key: Optional[str] = Header(default
     from_dt = payload.from_dt or (now - timedelta(days=7))
     to_dt = payload.to_dt or now
 
-    # Qué campo de fecha usar
     date_field = (payload.date_field or "CREATED_DATE").upper()
     if date_field not in {"CREATED_DATE", "CLOSED_DATE", "DEADLINE"}:
         raise HTTPException(
@@ -216,7 +247,6 @@ async def list_tasks(payload: TasksIn, x_api_key: Optional[str] = Header(default
         f">={date_field}": _fmt(from_dt),
         f"<={date_field}": _fmt(to_dt),
     }
-
     if payload.responsible_ids:
         filt["RESPONSIBLE_ID"] = payload.responsible_ids
     if payload.member_ids:
@@ -264,9 +294,6 @@ async def list_calendar(payload: CalendarIn, x_api_key: Optional[str] = Header(d
     owner_ids = payload.owner_ids or []
 
     items: List[Dict[str, Any]] = []
-
-    # La API de calendario suele requerir ownerId y type='user' por cada dueño
-    # (no tiene paginación start de la misma manera).
     for owner_id in owner_ids:
         params = {
             "type": "user",
@@ -277,9 +304,17 @@ async def list_calendar(payload: CalendarIn, x_api_key: Optional[str] = Header(d
         }
         data = await _bitrix_call("calendar.event.get", params)
         result = data.get("result", {})
-        # La clave suele ser 'items'
         events = result.get("items", [])
         if isinstance(events, list):
             items.extend(events)
 
     return {"items": items, "count": len(items)}
+
+
+# ----------------------------
+# Run local
+# ----------------------------
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
