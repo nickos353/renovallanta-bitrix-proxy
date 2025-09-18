@@ -379,6 +379,73 @@ async def list_calendar(payload: CalendarIn, x_api_key: Optional[str] = Header(d
 
     return {"items": items, "count": len(items)}
 
+# ----------------------------
+# Task comments (opcional pero recomendado)
+# ----------------------------
+class TaskCommentsIn(BaseModel):
+    task_ids: List[int]
+    limit_per_task: Optional[int] = 5  # 0 = sin límite
+
+def _pick(d: Dict[str, Any], *keys: str) -> Optional[Any]:
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return None
+
+@app.post("/task_comments")
+async def task_comments(payload: TaskCommentsIn, x_api_key: Optional[str] = Header(default=None)):
+    await ensure_api_key(x_api_key)
+
+    out: Dict[str, List[Dict[str, Any]]] = {}
+
+    # Posibles métodos REST para comentarios según versión/portal
+    candidates = [
+        "task.commentitem.getlist",   # legacy
+        "task.commentitem.getList",   # legacy camel
+        "tasks.task.getComments",     # nuevo en algunos portales
+    ]
+
+    for tid in payload.task_ids:
+        comments: List[Dict[str, Any]] = []
+
+        for method in candidates:
+            try:
+                # Cada método puede esperar nombres distintos
+                params = {"taskId": int(tid)}
+                data = await _bitrix_call(method, params)
+                res = data.get("result", [])
+
+                # Normalizar distintas formas de respuesta
+                if isinstance(res, dict):
+                    res = res.get("comments") or res.get("items") or []
+
+                # Mapear a un formato plano y amigable
+                for c in (res or []):
+                    comments.append({
+                        "id": _pick(c, "ID", "id"),
+                        "author_id": _pick(c, "AUTHOR_ID", "authorId", "AUTHOR"),
+                        "author_name": (_pick(c, "AUTHOR_NAME", "authorName")
+                                        or (_pick(c, "AUTHOR", "author") or {}).get("name")),
+                        "created_at": _pick(c, "POST_DATE", "createdDate", "dateCreate", "DATE_CREATE"),
+                        "text": (_pick(c, "POST_MESSAGE", "text", "message") or "").strip(),
+                    })
+                if comments:
+                    break  # ya obtuvimos comentarios con este método
+            except HTTPException:
+                # Bitrix puede devolver {"error": "..."} si el método no existe en el plan/portal
+                continue
+            except Exception:
+                continue
+
+        # Ordenar por fecha y recortar
+        comments = sorted(comments, key=lambda x: x.get("created_at") or "")
+        if (payload.limit_per_task or 0) > 0:
+            comments = comments[-int(payload.limit_per_task):]
+
+        out[str(tid)] = comments
+
+    return {"items": out, "count": sum(len(v) for v in out.values())}
+
 
 # ----------------------------
 # Run local
