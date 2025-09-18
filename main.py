@@ -37,7 +37,7 @@ def log(*args: Any) -> None:
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Renovallanta Bitrix Proxy", version="1.4.1")
+app = FastAPI(title="Renovallanta Bitrix Proxy", version="1.4.2")
 
 # CORS (ajústalo según tus necesidades)
 app.add_middleware(
@@ -181,7 +181,7 @@ async def ping():
 
 
 # ----------------------------
-# Diagnóstico de auth (igual que tu versión)
+# Diagnóstico de auth
 # ----------------------------
 async def _get_any_key(
     x_api_key: Optional[str] = Header(default=None),
@@ -204,7 +204,7 @@ async def auth_check(
 
 
 # ----------------------------
-# Users (reemplaza toda esta sección)
+# Users (con búsqueda y paginación)
 # ----------------------------
 def _truthy(v):
     # Acepta True/False, "Y"/"N", "1"/"0", "true"/"false", etc.
@@ -215,7 +215,13 @@ def _truthy(v):
     return str(v).strip().upper() in {"Y", "YES", "SI", "TRUE", "1"}
 
 @app.get("/users")
-async def list_users(x_api_key: Optional[str] = Header(default=None)):
+async def list_users(
+    x_api_key: Optional[str] = Header(default=None),
+    q: Optional[str] = Query(None, description="Filtro por nombre/apellido"),
+    include_inactive: bool = Query(False, description="Incluir usuarios inactivos"),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
     await ensure_api_key(x_api_key)
 
     # 1) Intento principal
@@ -225,8 +231,20 @@ async def list_users(x_api_key: Optional[str] = Header(default=None)):
     if not rows:
         rows = await bitrix_fetch_all("user.search", {"ACTIVE": "true"})
 
-    # Filtra activos con tolerancia a formato
-    active = [u for u in rows if _truthy(u.get("ACTIVE", True))]
+    # Filtrado por activos (salvo que pidan incluir inactivos)
+    if not include_inactive:
+        rows = [u for u in rows if _truthy(u.get("ACTIVE", True))]
+
+    # Búsqueda simple por nombre completo
+    if q:
+        ql = q.lower()
+        def full_name(u: Dict[str, Any]) -> str:
+            return f"{u.get('NAME','')} {u.get('LAST_NAME','')}".strip()
+        rows = [u for u in rows if ql in full_name(u).lower()]
+
+    total = len(rows)
+    # Paginación
+    rows = rows[offset: offset + limit]
 
     items = [
         {
@@ -236,9 +254,9 @@ async def list_users(x_api_key: Optional[str] = Header(default=None)):
             "WORK_POSITION": u.get("WORK_POSITION"),
             "ACTIVE": u.get("ACTIVE"),
         }
-        for u in active
+        for u in rows
     ]
-    return {"items": items, "count": len(items)}
+    return {"items": items, "count": len(items), "total": total, "offset": offset, "limit": limit}
 
 
 # ----------------------------
