@@ -17,6 +17,9 @@ _raw_base = os.getenv("BITRIX_WEBHOOK_BASE") or ""
 BITRIX_BASE = _raw_base.strip()
 API_KEY = os.getenv("API_KEY")  # si no está definido, no se exige clave
 
+# Nuevo: offset de zona horaria para Bitrix (p. ej. "-05:00", "+03:00" o "Z")
+TZ_OFFSET = (os.getenv("BITRIX_TZ_OFFSET") or "Z").strip()
+
 if not BITRIX_BASE:
     raise RuntimeError("Falta la variable de entorno BITRIX_WEBHOOK_BASE")
 
@@ -30,6 +33,22 @@ def _fmt(dt: datetime) -> str:
     """Formatea datetimes a 'YYYY-MM-DDTHH:MM:SS' (sin zona horaria)."""
     return dt.strftime("%Y-%m-%dT%H:%M:%S")
 
+def _fmt_with_offset(dt: datetime) -> str:
+    """
+    Devuelve 'YYYY-MM-DDTHH:MM:SS' + offset.
+    Si TZ_OFFSET = 'Z' -> agrega 'Z'.
+    Si TZ_OFFSET = '-05:00' -> agrega '-05:00'.
+    """
+    base = _fmt(dt)
+    off = TZ_OFFSET
+    if off.upper() == "Z":
+        return base + "Z"
+    # Validación súper simple
+    if not (off.startswith("+") or off.startswith("-")) or len(off) not in (6, 3):
+        # Por seguridad, si el formato es raro, usa 'Z'
+        return base + "Z"
+    return base + off
+
 def log(*args: Any) -> None:
     print(*args, file=sys.stdout, flush=True)
 
@@ -37,7 +56,7 @@ def log(*args: Any) -> None:
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Renovallanta Bitrix Proxy", version="1.4.2")
+app = FastAPI(title="Renovallanta Bitrix Proxy", version="1.5.1")
 
 # CORS (ajústalo según tus necesidades)
 app.add_middleware(
@@ -78,7 +97,6 @@ async def _bitrix_call(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
     assert _session is not None, "HTTP session no inicializada"
     url = _join_method(BITRIX_BASE, method)
     async with _session.post(url, json=params) as resp:
-        # Devolvemos el JSON (o error entendible) sin ocultar códigos HTTP
         try:
             data = await resp.json()
         except Exception:
@@ -177,7 +195,7 @@ async def root():
 
 @app.get("/ping")
 async def ping():
-    return {"ok": True, "service": "renovallanta-bitrix-proxy"}
+    return {"ok": True, "service": "Bitrix Proxy API is online"}
 
 
 # ----------------------------
@@ -204,7 +222,7 @@ async def auth_check(
 
 
 # ----------------------------
-# Users (con búsqueda y paginación)
+# Users
 # ----------------------------
 def _truthy(v):
     # Acepta True/False, "Y"/"N", "1"/"0", "true"/"false", etc.
@@ -215,13 +233,7 @@ def _truthy(v):
     return str(v).strip().upper() in {"Y", "YES", "SI", "TRUE", "1"}
 
 @app.get("/users")
-async def list_users(
-    x_api_key: Optional[str] = Header(default=None),
-    q: Optional[str] = Query(None, description="Filtro por nombre/apellido"),
-    include_inactive: bool = Query(False, description="Incluir usuarios inactivos"),
-    limit: int = Query(100, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
-):
+async def list_users(x_api_key: Optional[str] = Header(default=None)):
     await ensure_api_key(x_api_key)
 
     # 1) Intento principal
@@ -231,20 +243,8 @@ async def list_users(
     if not rows:
         rows = await bitrix_fetch_all("user.search", {"ACTIVE": "true"})
 
-    # Filtrado por activos (salvo que pidan incluir inactivos)
-    if not include_inactive:
-        rows = [u for u in rows if _truthy(u.get("ACTIVE", True))]
-
-    # Búsqueda simple por nombre completo
-    if q:
-        ql = q.lower()
-        def full_name(u: Dict[str, Any]) -> str:
-            return f"{u.get('NAME','')} {u.get('LAST_NAME','')}".strip()
-        rows = [u for u in rows if ql in full_name(u).lower()]
-
-    total = len(rows)
-    # Paginación
-    rows = rows[offset: offset + limit]
+    # Filtra activos con tolerancia a formato
+    active = [u for u in rows if _truthy(u.get("ACTIVE", True))]
 
     items = [
         {
@@ -254,9 +254,9 @@ async def list_users(
             "WORK_POSITION": u.get("WORK_POSITION"),
             "ACTIVE": u.get("ACTIVE"),
         }
-        for u in rows
+        for u in active
     ]
-    return {"items": items, "count": len(items), "total": total, "offset": offset, "limit": limit}
+    return {"items": items, "count": len(items)}
 
 
 # ----------------------------
@@ -316,7 +316,7 @@ async def list_tasks(payload: TasksIn, x_api_key: Optional[str] = Header(default
 
 
 # ----------------------------
-# Calendar
+# Calendar (con fallback de zona horaria)
 # ----------------------------
 @app.post("/calendar")
 async def list_calendar(payload: CalendarIn, x_api_key: Optional[str] = Header(default=None)):
@@ -327,20 +327,55 @@ async def list_calendar(payload: CalendarIn, x_api_key: Optional[str] = Header(d
     to_dt = payload.to_dt or now
     owner_ids = payload.owner_ids or []
 
+    if not owner_ids:
+        return {"items": [], "count": 0}
+
     items: List[Dict[str, Any]] = []
-    for owner_id in owner_ids:
-        params = {
+    errors: List[str] = []
+
+    async def _fetch_for_owner(owner_id: int) -> None:
+        # 1) intento sin offset
+        base_params = {
             "type": "user",
             "ownerId": owner_id,
             "from": _fmt(from_dt),
             "to": _fmt(to_dt),
             "attendees": "N",
         }
-        data = await _bitrix_call("calendar.event.get", params)
-        result = data.get("result", {})
-        events = result.get("items", [])
-        if isinstance(events, list):
-            items.extend(events)
+        try:
+            data = await _bitrix_call("calendar.event.get", base_params)
+            result = data.get("result", {})
+            evs = result.get("items", [])
+            if isinstance(evs, list):
+                items.extend(evs)
+            return
+        except HTTPException as e1:
+            errors.append(f"owner {owner_id} naive error: {e1.detail}")
+
+        # 2) fallback con offset/Z
+        tz_params = {
+            "type": "user",
+            "ownerId": owner_id,
+            "from": _fmt_with_offset(from_dt),
+            "to": _fmt_with_offset(to_dt),
+            "attendees": "N",
+        }
+        try:
+            data = await _bitrix_call("calendar.event.get", tz_params)
+            result = data.get("result", {})
+            evs = result.get("items", [])
+            if isinstance(evs, list):
+                items.extend(evs)
+            return
+        except HTTPException as e2:
+            errors.append(f"owner {owner_id} tz error: {e2.detail}")
+
+    # Ejecuta en serie para evitar rate-limit
+    for oid in owner_ids:
+        await _fetch_for_owner(int(oid))
+
+    if not items and errors:
+        raise HTTPException(status_code=502, detail={"message": "calendar fetch failed", "errors": errors})
 
     return {"items": items, "count": len(items)}
 
